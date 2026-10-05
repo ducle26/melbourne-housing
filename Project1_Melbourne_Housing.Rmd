@@ -1,0 +1,392 @@
+---
+title: "What Drives House Prices in Melbourne?"
+author: "Duc (Bill) Le"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  word_document:
+    toc: true
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    theme: flatly
+    code_folding: show
+subtitle: BZAN 6351 | Project 1
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 8, fig.height = 4.5, dpi = 150)
+```
+
+# Define Objectives
+
+**Business problem.** A Melbourne real estate agency sets a price guide for every new listing. Today that guide comes from an agent's judgment and a few nearby sales. If the guide is too high, the home sits unsold; if it is too low, the seller loses money and the agency loses trust.
+
+**Research questions.**
+
+1. Which property features and locations drive sale price the most?
+2. Can a model built on facts known at listing time (type, rooms, bathrooms, parking, land, distance, region) predict sale price closely enough to support a price guide?
+
+**Success measure.** Test-set accuracy in dollars (RMSE, MAE) and in percent (MAPE), plus clear, readable price drivers that an agent can explain to a seller.
+
+# Data Collection & Understanding
+
+```{r libs}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(scales)
+library(rpart)
+library(randomForest)
+library(car)
+library(knitr)
+
+# Shared look for every chart
+pal <- c(House = "#B5472B", Townhouse = "#5E7F7B", Unit = "#D4A03A")
+theme_proj <- theme_minimal(base_size = 12) +
+  theme(panel.grid.minor = element_blank(),
+        plot.title = element_text(face = "bold"),
+        plot.title.position = "plot",
+        legend.position = "top")
+theme_set(theme_proj)
+```
+
+**Source.** Melbourne Housing Snapshot, scraped from public listings on Domain.com.au by Tony Pino and published on Kaggle by Dan Becker (sales from January 2016 to September 2017).
+
+```{r load}
+raw <- read.csv("Melbourne_Data.csv", check.names = FALSE,
+                na.strings = c("", "NA"), stringsAsFactors = FALSE)
+raw <- raw[, -1]                      # first column is an old row index
+dim(raw)
+str(raw)
+```
+
+```{r dictionary, echo=FALSE}
+dict <- data.frame(
+  Variable = c("Price", "Type", "Rooms / Bedroom2", "Bathroom", "Car",
+               "Landsize", "BuildingArea", "YearBuilt", "Distance",
+               "Regionname / Suburb / CouncilArea", "Lattitude / Longtitude",
+               "Method / SellerG / Date"),
+  Kind = c("Numeric (target)", "Categorical: h, t, u", "Integer", "Integer",
+           "Integer", "Numeric, m²", "Numeric, m²", "Integer", "Numeric, km to CBD",
+           "Categorical", "Numeric", "Sale details"),
+  Note = c("Sale price in AUD", "House, townhouse, unit",
+           "Rooms from listing; Bedroom2 from a second source", "", "Parking spots",
+           "Shared land for units", "Floor area", "", "",
+           "Location labels", "Coordinates", "Known only after sale"))
+kable(dict, caption = "Data dictionary")
+```
+
+```{r missing-profile}
+miss <- data.frame(variable = names(raw),
+                   pct_missing = round(colMeans(is.na(raw)) * 100, 1)) %>%
+  arrange(desc(pct_missing))
+kable(head(miss, 10), caption = "Share of missing values (top 10)")
+
+ggplot(filter(miss, pct_missing > 0),
+       aes(reorder(variable, pct_missing), pct_missing)) +
+  geom_col(fill = "#5E7F7B") +
+  geom_text(aes(label = paste0(pct_missing, "%")), hjust = -0.1, size = 3.5) +
+  coord_flip() + expand_limits(y = 70) +
+  labs(title = "BuildingArea and YearBuilt are missing for about half the sales",
+       x = NULL, y = "% missing")
+```
+
+**Limitations noted up front.**
+
+* BuildingArea (58% missing) and YearBuilt (51% missing) are too sparse to use without heavy guessing.
+* The data covers 2016–2017 only, so the model reflects that market, not today's prices.
+* Sales scraped from one listing site; private sales that were never advertised are not in it.
+* Method, SellerG and Date are only known once the sale happens, so they do not belong in a listing-time price model.
+
+# Data Cleaning & Preparation
+
+```{r clean}
+log_step <- data.frame(step = "Raw file", rows = nrow(raw))
+
+# 1. Duplicates: same address, suburb and sale date = double entry
+d <- raw %>% distinct(Address, Suburb, Date, .keep_all = TRUE)
+log_step <- rbind(log_step, data.frame(step = "Remove duplicate sales", rows = nrow(d)))
+
+d %>% count(Address, Suburb) %>% filter(n > 1) %>% nrow()   # 147 repeat-sale homes
+
+# 2. Formatting: dates, readable labels, merge tiny regions
+d <- d %>%
+  mutate(Date = as.Date(Date, format = "%d/%m/%Y"),
+         Type = factor(dplyr::recode(Type, h = "House", t = "Townhouse", u = "Unit"),
+                       levels = c("House", "Townhouse", "Unit")),
+         Region = case_when(grepl("Victoria", Regionname) ~ "Regional Victoria",
+                            TRUE ~ sub(" Metropolitan", "", Regionname)),
+         Region = factor(Region))
+table(d$Region, useNA = "ifany")
+
+# 3. Impossible values become missing
+d <- d %>%
+  mutate(YearBuilt    = ifelse(YearBuilt < 1840, NA, YearBuilt),   # before Melbourne existed
+         BuildingArea = ifelse(BuildingArea == 0, NA, BuildingArea),
+         Bathroom     = ifelse(Bathroom == 0, NA, Bathroom))       # every dwelling has one
+
+# 4. Rows missing the core layout fields (Bathroom, Bedroom2, Car come missing together)
+d <- d %>% filter(!is.na(Bathroom), !is.na(Region), !is.na(Distance))
+log_step <- rbind(log_step, data.frame(step = "Drop rows missing core fields", rows = nrow(d)))
+
+# 5. Entry errors: Bedroom2 far above Rooms
+d <- d %>% filter(is.na(Bedroom2) | Bedroom2 <= Rooms + 2)
+log_step <- rbind(log_step, data.frame(step = "Drop room-count conflicts", rows = nrow(d)))
+
+# 6. Fill remaining gaps with the median for that property type
+d <- d %>% group_by(Type) %>%
+  mutate(Landsize = ifelse(is.na(Landsize), median(Landsize, na.rm = TRUE), Landsize),
+         Car      = ifelse(is.na(Car),      median(Car,      na.rm = TRUE), Car)) %>%
+  ungroup()
+
+colSums(is.na(d[, c("Price","Rooms","Bathroom","Car","Landsize","Distance","Type","Region")]))
+kable(log_step, caption = "Row count after each cleaning step")
+```
+
+**Outliers.** Prices run from about \$85K to \$9M. These are real sales, so they stay in, but the model uses log(Price) so a handful of mansions cannot pull the fit. Landsize is different: values such as 433,014 m² for a suburban house are entry errors, so it is capped at the 99th percentile.
+
+```{r outliers}
+cap <- quantile(d$Landsize, 0.99)
+cap
+sum(d$Landsize > cap)
+d <- d %>% mutate(Landsize = pmin(Landsize, cap),
+                  logPrice = log(Price))
+
+iqr_flag <- with(d, Price > quantile(Price, .75) + 1.5 * IQR(Price))
+sum(iqr_flag)       # flagged by the 1.5×IQR rule on the raw price scale
+iqr_log <- with(d, logPrice > quantile(logPrice, .75) + 1.5 * IQR(logPrice) |
+                   logPrice < quantile(logPrice, .25) - 1.5 * IQR(logPrice))
+sum(iqr_log)        # far fewer once prices are on the log scale
+
+p_raw <- ggplot(d, aes(Price / 1e6)) + geom_histogram(bins = 60, fill = "#B5472B") +
+  labs(title = "Raw price: long right tail", x = "Price (AUD millions)", y = "Sales")
+p_log <- ggplot(d, aes(logPrice)) + geom_histogram(bins = 60, fill = "#5E7F7B") +
+  labs(title = "log(Price): close to symmetric", x = "log(Price)", y = "Sales")
+p_raw; p_log
+```
+
+# Exploratory Data Analysis
+
+```{r summary-stats}
+d %>% group_by(Type) %>%
+  summarise(sales = n(), median_price = median(Price), mean_price = mean(Price),
+            median_km = median(Distance), median_rooms = median(Rooms)) %>%
+  kable(format.args = list(big.mark = ","), digits = 1,
+        caption = "Summary by property type")
+```
+
+## Location
+
+```{r eda-distance}
+ggplot(d, aes(Distance, Price / 1e6, colour = Type)) +
+  geom_point(alpha = 0.12, size = 0.8) +
+  geom_smooth(se = FALSE, method = "loess", linewidth = 1.2) +
+  scale_colour_manual(values = pal) +
+  scale_y_log10(labels = label_dollar(suffix = "M", accuracy = 0.1)) +
+  coord_cartesian(xlim = c(0, 40)) +
+  labs(title = "Prices fall with distance from the CBD, for every property type",
+       x = "Distance to CBD (km)", y = "Price (log scale)", colour = NULL)
+
+d %>% group_by(Region) %>%
+  summarise(median_price = median(Price), n = n()) %>%
+  ggplot(aes(reorder(Region, median_price), median_price / 1e6)) +
+  geom_col(fill = "#5E7F7B") +
+  geom_text(aes(label = dollar(median_price / 1e6, suffix = "M", accuracy = 0.01)),
+            hjust = -0.1, size = 3.5) +
+  coord_flip() + expand_limits(y = 1.6) +
+  labs(title = "Southern Metro median sits about 60% above Western Metro",
+       x = NULL, y = "Median price (AUD millions)")
+```
+
+```{r eda-map, fig.height=6}
+d %>% filter(!is.na(Lattitude)) %>%
+  ggplot(aes(Longtitude, Lattitude, colour = logPrice)) +
+  geom_point(size = 0.6, alpha = 0.6) +
+  scale_colour_gradient(low = "#E9E3D5", high = "#7A1F10",
+                        breaks = log(c(5e5, 1e6, 2e6, 4e6)),
+                        labels = c("$0.5M", "$1M", "$2M", "$4M")) +
+  coord_quickmap() +
+  labs(title = "The price map: expensive homes ring the bay, south-east of the CBD",
+       x = NULL, y = NULL, colour = "Price")
+```
+
+## Property features
+
+```{r eda-features}
+ggplot(d, aes(factor(pmin(Rooms, 6)), Price / 1e6, fill = Type)) +
+  geom_boxplot(outlier.alpha = 0.1) +
+  scale_fill_manual(values = pal) +
+  scale_y_log10(labels = label_dollar(suffix = "M", accuracy = 0.1)) +
+  labs(title = "Each extra room adds value, and houses sit above units at every size",
+       x = "Rooms (6 = 6 or more)", y = "Price (log scale)", fill = NULL)
+
+num <- d %>% select(logPrice, Rooms, Bathroom, Car, Landsize, Distance)
+round(cor(num), 2)
+corrplot::corrplot(cor(num), method = "color", type = "upper",
+                   addCoef.col = "black", tl.col = "black", number.cex = 0.8)
+```
+
+## Time
+
+```{r eda-time}
+d %>% mutate(month = as.Date(format(Date, "%Y-%m-01"))) %>%
+  group_by(month) %>% summarise(median_price = median(Price), n = n()) %>%
+  filter(n > 50) %>%
+  ggplot(aes(month, median_price / 1e6)) +
+  geom_line(colour = "#B5472B", linewidth = 1) + geom_point(colour = "#B5472B") +
+  labs(title = "Monthly median price, 2016–2017", x = NULL, y = "AUD millions")
+```
+
+**Hypothesis test: are house prices higher than unit prices?**
+
+```{r ttest}
+t.test(logPrice ~ Type, data = filter(d, Type != "Townhouse"))
+```
+
+# Data Modeling & Analysis
+
+Three models, all using only listing-time facts:
+
+* **Multiple linear regression** on log(Price): easy to explain, each coefficient converts to a percent effect.
+* **Decision tree**: gives plain if/then pricing rules.
+* **Random forest**: many trees averaged; usually the most accurate.
+
+```{r split}
+set.seed(6351)
+model_df <- d %>% select(Price, logPrice, Type, Rooms, Bathroom, Car,
+                         Landsize, Distance, Region)
+idx   <- sample(seq_len(nrow(model_df)), size = 0.8 * nrow(model_df))
+train <- model_df[idx, ]
+test  <- model_df[-idx, ]
+c(train = nrow(train), test = nrow(test))
+
+f <- logPrice ~ Type + Rooms + Bathroom + Car + log1p(Landsize) + Distance + Region
+
+scores <- function(actual, pred_log, name) {
+  pred <- exp(pred_log)
+  data.frame(Model = name,
+             R2   = round(1 - sum((actual - pred)^2) / sum((actual - mean(actual))^2), 3),
+             RMSE = round(sqrt(mean((actual - pred)^2))),
+             MAE  = round(mean(abs(actual - pred))),
+             MAPE = round(mean(abs(actual - pred) / actual) * 100, 1))
+}
+```
+
+## Multiple linear regression
+
+```{r lm}
+lm_fit <- lm(f, data = train)
+summary(lm_fit)
+vif(lm_fit)                                 # all well under 5: no multicollinearity problem
+
+pct <- data.frame(term = names(coef(lm_fit))[-1],
+                  pct_effect = round((exp(coef(lm_fit)[-1]) - 1) * 100, 1))
+kable(pct, caption = "Coefficients as % change in price, other things equal")
+```
+
+```{r lm-diagnostics, fig.height=7}
+par(mfrow = c(2, 2)); plot(lm_fit); par(mfrow = c(1, 1))
+e <- resid(lm_fit)
+durbin_watson <- sum(diff(e)^2) / sum(e^2)
+durbin_watson                               # near 2 = errors are independent
+```
+
+The residual plots show roughly constant spread and a near-straight Q-Q line once price is logged, so the regression assumptions hold well enough for inference.
+
+## Decision tree
+
+```{r tree, fig.height=6}
+tree_fit <- rpart(f, data = train, method = "anova",
+                  control = rpart.control(cp = 0.01, maxdepth = 4))
+if (requireNamespace("rpart.plot", quietly = TRUE)) {
+  rpart.plot::rpart.plot(tree_fit, type = 4, extra = 101, roundint = FALSE)
+} else {
+  plot(tree_fit, uniform = TRUE, margin = 0.05); text(tree_fit, use.n = TRUE, cex = 0.7)
+}
+tree_fit
+```
+
+## Random forest
+
+```{r rf}
+set.seed(6351)
+rf_fit <- randomForest(logPrice ~ Type + Rooms + Bathroom + Car + Landsize + Distance + Region,
+                       data = train, ntree = 300, importance = TRUE)
+rf_fit
+
+imp <- data.frame(feature = rownames(importance(rf_fit)),
+                  inc_mse = importance(rf_fit)[, "%IncMSE"]) %>%
+  arrange(desc(inc_mse))
+imp$share <- round(imp$inc_mse / sum(imp$inc_mse) * 100, 1)
+kable(imp, digits = 1, caption = "Random forest variable importance")
+
+ggplot(imp, aes(reorder(feature, inc_mse), inc_mse)) +
+  geom_col(fill = "#B5472B") + coord_flip() +
+  labs(title = "Location and property type matter most",
+       x = NULL, y = "% increase in MSE when the feature is shuffled")
+```
+
+## Model comparison on the 20% test set
+
+```{r compare}
+results <- rbind(
+  scores(test$Price, predict(lm_fit,   test), "Linear regression"),
+  scores(test$Price, predict(tree_fit, test), "Decision tree"),
+  scores(test$Price, predict(rf_fit,   test), "Random forest"))
+kable(results, format.args = list(big.mark = ","),
+      caption = "Test-set accuracy (prices back on the dollar scale)")
+
+test$pred_rf <- exp(predict(rf_fit, test))
+ggplot(test, aes(pred_rf / 1e6, Price / 1e6, colour = Type)) +
+  geom_point(alpha = 0.35, size = 1) +
+  geom_abline(linetype = 2) +
+  scale_colour_manual(values = pal) +
+  scale_x_log10() + scale_y_log10() +
+  labs(title = "Random forest: predicted vs actual (test set)",
+       x = "Predicted (AUD M, log)", y = "Actual (AUD M, log)", colour = NULL)
+
+within10 <- mean(abs(test$pred_rf - test$Price) / test$Price <= 0.10) * 100
+within20 <- mean(abs(test$pred_rf - test$Price) / test$Price <= 0.20) * 100
+round(c(within10 = within10, within20 = within20), 1)
+```
+
+```{r export, include=FALSE}
+# Numbers and chart data reused in the slides
+dir.create("out", showWarnings = FALSE)
+write.csv(results, "out/model_results.csv", row.names = FALSE)
+write.csv(pct, "out/lm_pct_effects.csv", row.names = FALSE)
+write.csv(imp, "out/rf_importance.csv", row.names = FALSE)
+write.csv(log_step, "out/cleaning_steps.csv", row.names = FALSE)
+write.csv(miss, "out/missing.csv", row.names = FALSE)
+write.csv(d %>% group_by(Region) %>% summarise(median_price = median(Price), n = n()),
+          "out/region_median.csv", row.names = FALSE)
+write.csv(d %>% group_by(Type) %>% summarise(median_price = median(Price), n = n()),
+          "out/type_median.csv", row.names = FALSE)
+write.csv(data.frame(within10 = within10, within20 = within20,
+                     r2_lm = summary(lm_fit)$r.squared, adj_r2_lm = summary(lm_fit)$adj.r.squared,
+                     dw = durbin_watson, n_clean = nrow(d), n_raw = nrow(raw),
+                     n_train = nrow(train), n_test = nrow(test), cap = cap,
+                     iqr_raw = sum(iqr_flag), iqr_log = sum(iqr_log)),
+          "out/key_numbers.csv", row.names = FALSE)
+capture.output(tree_fit, file = "out/tree.txt")
+```
+
+# Insights & Recommendations
+
+1. **Location sets the base price.** Each extra km from the CBD cuts price by about `r abs(pct$pct_effect[pct$term=="Distance"])`% with everything else held equal, and region moves price by up to a quarter, up or down, against the Eastern suburbs at the same distance. The price guide should start from location, then adjust for the home.
+2. **Property type is the next biggest lever.** A unit sells for about `r abs(pct$pct_effect[pct$term=="TypeUnit"])`% less than a comparable house, a townhouse about `r abs(pct$pct_effect[pct$term=="TypeTownhouse"])`% less. Agents should never price a unit off nearby house sales.
+3. **Rooms and bathrooms pay; parking and extra land add little.** One more room adds about `r pct$pct_effect[pct$term=="Rooms"]`% and one more bathroom about `r pct$pct_effect[pct$term=="Bathroom"]`%, while a parking spot adds only `r pct$pct_effect[pct$term=="Car"]`%. In seller meetings, agents should lead with layout; once location is set, a bigger block or an extra parking spot moves the price very little.
+4. **Use the random forest as a first-draft price guide.** It is the most accurate model (MAPE `r results$MAPE[3]`%), and `r round(within20)`% of test homes land within 20% of the real price. Agents should review any listing where their own guide differs from the model by more than 20%.
+5. **Collect floor area and build year at listing.** They were missing for half the sales; filling them in is the cheapest way to make the model sharper.
+
+# References
+
+* Becker, D. (2018). *Melbourne Housing Snapshot* [Data set; data scraped by T. Pino from Domain.com.au]. Kaggle. https://www.kaggle.com/datasets/dansbecker/melbourne-housing-snapshot
+* James, G., Witten, D., Hastie, T., & Tibshirani, R. (2021). *An Introduction to Statistical Learning with Applications in R* (2nd ed.). Springer.
+* Breiman, L. (2001). Random forests. *Machine Learning, 45*(1), 5–32.
+* Therneau, T., & Atkinson, B. (2023). *rpart: Recursive partitioning and regression trees* [R package].
+* Wickham, H. (2016). *ggplot2: Elegant Graphics for Data Analysis*. Springer.
+* R Core Team (2024). *R: A Language and Environment for Statistical Computing*. R Foundation for Statistical Computing.
+* Singh, R. (2026). *BZAN 6351 Week 3: Regression and Machine Learning* [Lecture slides]. University of Houston.
